@@ -1,12 +1,15 @@
 # Python
-backend/.venv/
-backend/__pycache__/
+.venv/
+__pycache__/
 
 # Environment
 backend/.env
 
+# Benchmark results
+experiments/benchmark/results/
+
 # Node
-frontend/node_modules/
+node_modules/
 frontend/dist/
 
 # VS Code
