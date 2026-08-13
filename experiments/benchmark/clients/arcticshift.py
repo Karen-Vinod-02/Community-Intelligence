@@ -23,7 +23,7 @@ from config import ARCTIC_SHIFT_BASE, REQUEST_TIMEOUT_SECONDS, MAX_RETRIES, RETR
 from metrics import CallResult, Timer
 
 
-HEADERS = {"User-Agent": "community-intelligence-benchmark/0.1 (university capstone project)"}
+HEADERS = {"User-Agent": "community-intelligence-benchmark/0.1"}
 
 
 def _request_with_retries(url: str, params: dict):
