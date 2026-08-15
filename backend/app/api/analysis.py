@@ -1,19 +1,29 @@
 from fastapi import APIRouter
-
-from app.models.analysis import AnalyzeRequest, AnalyzeResponse
-from app.services.reddit.service import RedditService
+from app.models.analysis import AnalyzeRequest, AnalyzeResponse, CommunityResult
+from app.services.community import CommunityService
 
 router = APIRouter()
-reddit_service = RedditService()
+community_service = CommunityService()
 
 @router.post("/analyze", response_model=AnalyzeResponse)
 def analyze(request: AnalyzeRequest):
-    posts = reddit_service.search_posts(
-        subreddit="startups",
-        limit=5,
+    ranked_communities = community_service.analyze(
+        request.description,
+        candidate_limit=10,
+        result_limit=5,
+        posts_per_community=5,
     )
+
+    communities = [
+        CommunityResult(
+            subreddit=result["subreddit"],
+            score=result["score"],
+            posts=result["top_posts"],
+        )
+        for result in ranked_communities
+    ]
 
     return AnalyzeResponse(
         description=request.description,
-        posts=posts,
+        communities=communities,
     )
