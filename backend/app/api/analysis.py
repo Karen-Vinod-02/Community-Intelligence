@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from app.models.analysis import AnalyzeRequest, AnalyzeResponse, CommunityResult
-from app.services.community import CommunityService
+from app.services.community import CommunityService, _belongs_to_subreddit
 
 router = APIRouter()
 community_service = CommunityService()
@@ -11,16 +11,21 @@ def analyze(request: AnalyzeRequest):
         request.description,
         candidate_limit=10,
         result_limit=5,
-        posts_per_community=5,
+        posts_per_community=15,
     )
 
     communities = [
         CommunityResult(
             subreddit=result["subreddit"],
             score=result["score"],
-            posts=result["top_posts"],
+            posts=[
+                post
+                for post in result["top_posts"]
+                if _belongs_to_subreddit(post, result["subreddit"])
+            ],
         )
         for result in ranked_communities
+        if result["signals"].get("problem_relevant_posts", 0) > 0
     ]
 
     return AnalyzeResponse(

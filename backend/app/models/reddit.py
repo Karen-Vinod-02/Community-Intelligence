@@ -11,6 +11,7 @@ class RedditPost(BaseModel):
     num_comments: int | None = None
     created_utc: float | None = None
     url: str | None = None
+    evidence_status: str | None = None
 
 
 class RedditComment(BaseModel):

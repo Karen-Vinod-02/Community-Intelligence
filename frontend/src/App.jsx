@@ -1,18 +1,21 @@
 import { useState } from "react";
+import "./App.css";
 
 function App() {
   const [description, setDescription] = useState("");
-  const [result, setResult] = useState("");
+  const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const handleAnalyze = async () => {
     if (!description.trim()) {
-      alert("Please enter a product description.");
+      setError("Please enter a product description.");
       return;
     }
 
     setLoading(true);
-    setResult("");
+    setResult(null);
+    setError("");
 
     try {
       const response = await fetch("http://localhost:8000/api/analyze", {
@@ -21,49 +24,130 @@ function App() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          description: description,
+          description: description.trim(),
         }),
       });
 
       if (!response.ok) {
-        throw new Error("Failed to analyze.");
+        throw new Error("Failed to analyze the product.");
       }
 
       const data = await response.json();
-      setResult(data.description);
+      setResult(data);
     } catch (error) {
       console.error(error);
-      setResult("Something went wrong.");
+      setError(
+        "Could not analyze the product. Make sure the backend is running."
+      );
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div style={{ padding: "40px", maxWidth: "800px", margin: "0 auto" }}>
-      <h1>Community Intelligence Engine</h1>
+    <main className="app">
+      <section className="hero-section">
+        <p className="eyebrow">COMMINT</p>
 
-      <textarea
-        rows="8"
-        style={{ width: "100%", marginTop: "20px" }}
-        placeholder="Describe your product..."
-        value={description}
-        onChange={(e) => setDescription(e.target.value)}
-      />
+        <h1>Find where your users are already talking.</h1>
 
-      <br />
-      <br />
+        <p className="subtitle">
+          Describe your product and discover the online communities where
+          people are discussing problems related to it.
+        </p>
 
-      <button onClick={handleAnalyze} disabled={loading}>
-        {loading ? "Analyzing..." : "Analyze"}
-      </button>
+        <div className="input-container">
+          <textarea
+            rows="6"
+            placeholder="Describe your product..."
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            disabled={loading}
+          />
 
-      <hr style={{ margin: "30px 0" }} />
+          <button onClick={handleAnalyze} disabled={loading}>
+            {loading ? "Analyzing..." : "Find Communities"}
+          </button>
+        </div>
 
-      <h2>Result</h2>
+        {error && <p className="error">{error}</p>}
+      </section>
 
-      <p>{result}</p>
-    </div>
+      {loading && (
+        <section className="status">
+          <div className="loader"></div>
+          <p>Finding relevant communities and discussions...</p>
+        </section>
+      )}
+
+      {result && !loading && (
+        <section className="results">
+          <div className="results-header">
+            <div>
+              <p className="eyebrow">RESULTS</p>
+              <h2>Relevant communities</h2>
+            </div>
+
+            <span className="result-count">
+              {result.communities.length} found
+            </span>
+          </div>
+
+          {result.communities.length === 0 ? (
+            <div className="empty-state">
+              <p>No relevant communities were found.</p>
+              <p>Try describing the problem your product solves in more detail.</p>
+            </div>
+          ) : (
+            <div className="community-list">
+              {result.communities.map((community) => (
+                <article
+                  className="community-card"
+                  key={community.subreddit}
+                >
+                  <div className="community-header">
+                    <div>
+                      <h3>r/{community.subreddit}</h3>
+                      <p className="score">
+                        Relevance: {(community.score * 100).toFixed(1)}%
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="posts">
+                    <h4>Relevant discussions</h4>
+
+                    {community.posts.map((post) => (
+                      <div className="post" key={post.id || post.title}>
+                        <h5>{post.title}</h5>
+
+                        {post.body && (
+                          <p>
+                            {post.body.length > 300
+                              ? `${post.body.slice(0, 300)}...`
+                              : post.body}
+                          </p>
+                        )}
+
+                        {post.url && (
+                          <a
+                            href={post.url}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            View discussion
+                          </a>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+    </main>
   );
 }
 

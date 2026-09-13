@@ -1,10 +1,11 @@
 import time
+import os
 
 import requests
 
 from app.models.reddit import RedditPost, RedditComment
 from app.services.reddit.base import RedditSource
-import os
+
 
 ARCTIC_SHIFT_BASE = os.getenv(
     "ARCTIC_SHIFT_BASE",
@@ -12,9 +13,7 @@ ARCTIC_SHIFT_BASE = os.getenv(
 )
 
 HEADERS = {
-    "User-Agent": (
-        "community-intelligence/0.1 "
-    )
+    "User-Agent": "community-intelligence/0.1"
 }
 
 REQUEST_TIMEOUT_SECONDS = 30
@@ -49,13 +48,28 @@ class ArcticShiftSource(RedditSource):
                 )
 
                 response.raise_for_status()
+
                 return response
+
+            except requests.HTTPError as exc:
+                status = (
+                    exc.response.status_code
+                    if exc.response is not None
+                    else None
+                )
+
+                if status is not None and 400 <= status < 500:
+                    raise
+
+                last_exception = exc
 
             except requests.RequestException as exc:
                 last_exception = exc
 
-                if attempt < self.max_retries:
-                    time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+            if attempt < self.max_retries:
+                time.sleep(
+                    RETRY_BACKOFF_SECONDS * (attempt + 1)
+                )
 
         raise last_exception
 
@@ -68,17 +82,38 @@ class ArcticShiftSource(RedditSource):
 
         params = {
             "subreddit": subreddit,
-            "limit": limit,
+            "limit": min(limit, 100),
             "sort": "desc",
         }
 
         if query:
-            params["q"] = query
+            params["query"] = query
 
-        response = self._request(
-            "posts/search",
-            params,
-        )
+        try:
+            response = self._request(
+                "posts/search",
+                params,
+            )
+
+        except requests.HTTPError as exc:
+            status = (
+                exc.response.status_code
+                if exc.response is not None
+                else None
+            )
+
+            # If keyword search is rejected for a large/active
+            # subreddit, fall back to recent posts.
+            # Ranking layer will determine which posts & communities are actually relevant to the product.
+            if status == 422 and query:
+                params.pop("query", None)
+
+                response = self._request(
+                    "posts/search",
+                    params,
+                )
+            else:
+                raise
 
         payload = response.json()
         data = payload.get("data", [])
@@ -93,7 +128,11 @@ class ArcticShiftSource(RedditSource):
                 score=post.get("score"),
                 num_comments=post.get("num_comments"),
                 created_utc=post.get("created_utc"),
-                url=post.get("url"),
+                url=(
+                    f"https://www.reddit.com{post['permalink']}"
+                    if post.get("permalink", "").startswith("/")
+                    else post.get("url")
+                ),
             )
             for post in data
         ]
@@ -152,7 +191,11 @@ class ArcticShiftSource(RedditSource):
             ):
                 comments.append(payload)
 
-            for key in ("replies", "children", "comments"):
+            for key in (
+                "replies",
+                "children",
+                "comments",
+            ):
                 children = current.get(key)
 
                 if children:
