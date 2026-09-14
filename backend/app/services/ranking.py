@@ -503,9 +503,20 @@ class CommunityRanker:
             qualifying_count = len(
                 qualifying_posts
             )
+            # Diagnostic 
+            print(
+                f"\n[r/{candidate.subreddit}] "
+                f"total={total_posts}, "
+                f"qualifying={qualifying_count}"
+            )
 
-            # No actual problem evidence means the community
-            # should not be recommended.
+            for score, post, signals in scored_posts:
+                print(
+                    f"  {score:.3f} | "
+                    f"{signals['evidence_status']} | "
+                    f"{post.title}"
+                )
+            # No actual problem evidence means the community should not be recommended.
             if qualifying_count == 0:
                 continue
 
