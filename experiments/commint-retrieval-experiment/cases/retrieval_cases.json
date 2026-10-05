@@ -1,0 +1,20 @@
+[
+  {
+    "case_id": "study_accountability",
+    "queries": [
+      "study accountability",
+      "study partner",
+      "study motivation",
+      "virtual study partner",
+      "study together"
+    ],
+    "thread_queries": [
+      "study accountability"
+    ],
+    "top_communities": 5,
+    "candidate_posts_per_community": 20,
+    "top_threads": 15,
+    "comments_per_thread": 20,
+    "time_window_days": 90
+  }
+]

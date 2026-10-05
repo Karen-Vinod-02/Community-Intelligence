@@ -17,11 +17,49 @@ POST_RECENCY_WEIGHT = 0.05
 
 FRAME_WEIGHTS = {
     "actor_alignment": 0.10,
-    "activity_alignment": 0.20,
-    "interaction_alignment": 0.25,
-    "friction_alignment": 0.30,
-    "goal_alignment": 0.15,
+    "action_alignment": 0.20,
+    "target_alignment": 0.20,
+    "activity_alignment": 0.15,
+    "interaction_alignment": 0.15,
+    "friction_alignment": 0.20,
+    "goal_alignment": 0.10,
 }
+
+# NOTE (bugfix): these used to omit action_alignment/target_alignment
+# entirely, meaning the directional actor->action->target signal was
+# computed but never actually used to decide problem_relevant vs
+# weak_or_ambiguous -- only the topical frame_score saw it. That let
+# posts pass the evidence gate on activity/interaction overlap alone
+# (e.g. shared "developers" + "GitHub" vocabulary) even when the
+# action/target relationship didn't match at all. Restored here so
+# the gate actually reflects the representation the project is built
+# around.
+TASK_WEIGHTS = {
+    "actor_alignment": 0.10,
+    "action_alignment": 0.25,
+    "target_alignment": 0.25,
+    "activity_alignment": 0.20,
+    "interaction_alignment": 0.20,
+}
+
+PROBLEM_WEIGHTS = {
+    "friction_alignment": 0.65,
+    "goal_alignment": 0.35,
+}
+
+# NOTE (bugfix): previously a community could be labeled "Relevant"
+# off a single thin, borderline post (e.g. community_score ~0.12 from
+# 1-of-15 qualifying posts). This floor stops that: a community only
+# gets the "relevant" label if its AGGREGATE evidence clears a real
+# bar, not just "at least one post technically passed the post-level
+# gate." This is a floor on the aggregate score, not a change to any
+# post-level threshold.
+RELEVANT_COMMUNITY_SCORE_FLOOR = 0.20
+
+# Applied when a community only qualifies through the fallback
+# ("potential") tier, so it can never be confused with -- or, when
+# scores are close, outrank -- a genuinely "relevant" community.
+POTENTIAL_TIER_PENALTY = 0.6
 
 
 @dataclass
@@ -84,15 +122,45 @@ def _frame_texts(
     hypothesis: ProblemHypothesis,
 ) -> dict[str, str]:
     """
-    Return the semantic problem representation used for post-level comparison.
+    Return the semantic problem representation used for post-level
+    comparison.
+
+    Empty fields are intentionally excluded.
+
+    The representation explicitly separates actor, action, and target
+    so that directional relationships such as
+
+        small businesses -> find -> designers
+
+    are not collapsed into a single generic topic description.
     """
 
-    return {
+    frames = {
         "actor_alignment": hypothesis.actor or "",
+
+        "action_alignment": (
+            f"{hypothesis.actor or 'people'} "
+            f"{hypothesis.action} "
+            f"{hypothesis.target}"
+            if hypothesis.action and hypothesis.target
+            else ""
+        ),
+
+        "target_alignment": hypothesis.target or "",
+
         "activity_alignment": hypothesis.activity or "",
+
         "interaction_alignment": hypothesis.interaction or "",
+
         "friction_alignment": hypothesis.friction or "",
+
         "goal_alignment": hypothesis.goal or "",
+    }
+
+    return {
+        key: value
+        for key, value in frames.items()
+        if value.strip()
     }
 
 
@@ -102,41 +170,29 @@ def _frame_scores(
     embeddings,
 ) -> dict[str, float]:
     """
-    Compare a Reddit post independently against every dimension
+    Compare a Reddit post against every available dimension
     of the problem representation.
+
+    Only frames that actually exist in the hypothesis are returned.
     """
 
     frames = _frame_texts(hypothesis)
 
-    non_empty_frames = {
-        key: value
-        for key, value in frames.items()
-        if value
-    }
-
-    if not non_empty_frames:
-        return {
-            key: 0.0
-            for key in frames
-        }
+    if not frames:
+        return {}
 
     texts = [
         post_text,
-        *non_empty_frames.values(),
+        *frames.values(),
     ]
 
     vectors = embeddings.encode(texts)
 
     post_vector = vectors[0]
 
-    scores = {
-        key: 0.0
-        for key in frames
-    }
+    scores = {}
 
-    for index, key in enumerate(
-        non_empty_frames
-    ):
+    for index, key in enumerate(frames):
         similarity = float(
             post_vector @ vectors[index + 1]
         )
@@ -155,21 +211,51 @@ def _problem_frame_score(
     """
     Produce an overall problem-frame similarity score.
 
-    The score is weighted toward friction and interaction because
-    these dimensions distinguish the target problem from generic
-    topical discussion.
+    The score is normalized over the frames that actually exist
+    in the problem hypothesis.
     """
 
     weighted_sum = 0.0
     total_weight = 0.0
 
-    for key, weight in FRAME_WEIGHTS.items():
+    for key, score in frame_scores.items():
+        weight = FRAME_WEIGHTS.get(key)
+
+        if weight is None:
+            continue
+
+        weighted_sum += (
+            weight * score
+        )
+
+        total_weight += weight
+
+    if total_weight == 0:
+        return 0.0
+
+    return weighted_sum / total_weight
+
+
+def _normalised_weighted_score(
+    frame_scores: dict[str, float],
+    weights: dict[str, float],
+) -> float:
+    """
+    Compute a weighted average using only dimensions that are
+    actually available.
+    """
+
+    weighted_sum = 0.0
+    total_weight = 0.0
+
+    for key, weight in weights.items():
         if key not in frame_scores:
             continue
 
         weighted_sum += (
             weight * frame_scores[key]
         )
+
         total_weight += weight
 
     if total_weight == 0:
@@ -185,48 +271,55 @@ def _problem_evidence_score(
     Measure whether the post provides evidence of the actual
     problem rather than merely sharing the same topic.
 
-    Activity and interaction establish what the user is discussing.
-    Friction & goal establish why the problem matters.
+    Task evidence (actor/action/target/activity/interaction)
+    establishes what the user is discussing, INCLUDING the
+    directional actor->action->target relationship.
 
-    Friction receives the strongest weight because it is the most
-    direct representation of the underlying problem.
+    Problem evidence (friction/goal) establishes why the problem
+    matters.
+
+    Missing dimensions are excluded from the calculation rather
+    than treated as zero-valued evidence.
     """
 
-    activity = frame_scores.get(
-        "activity_alignment",
-        0.0,
+    task_evidence = _normalised_weighted_score(
+        frame_scores,
+        TASK_WEIGHTS,
     )
 
-    interaction = frame_scores.get(
-        "interaction_alignment",
-        0.0,
+    problem_evidence = _normalised_weighted_score(
+        frame_scores,
+        PROBLEM_WEIGHTS,
     )
 
-    friction = frame_scores.get(
-        "friction_alignment",
-        0.0,
-    )
+    available_components = []
 
-    goal = frame_scores.get(
-        "goal_alignment",
-        0.0,
-    )
+    if any(
+        key in frame_scores
+        for key in TASK_WEIGHTS
+    ):
+        available_components.append(
+            task_evidence
+        )
 
-    task_evidence = (
-        0.45 * activity
-        + 0.55 * interaction
-    )
+    if any(
+        key in frame_scores
+        for key in PROBLEM_WEIGHTS
+    ):
+        available_components.append(
+            problem_evidence
+        )
 
-    problem_evidence = (
-        0.65 * friction
-        + 0.35 * goal
-    )
+    if not available_components:
+        return 0.0
 
-    # geometric mean prevents one side from dominating.
-    evidence = (
-        max(task_evidence, 0.0)
-        * max(problem_evidence, 0.0)
-    ) ** 0.5
+    if len(available_components) == 2:
+        evidence = (
+            max(task_evidence, 0.0)
+            * max(problem_evidence, 0.0)
+        ) ** 0.5
+    else:
+        evidence = available_components[0]
 
     return max(
         0.0,
@@ -241,52 +334,27 @@ def _evidence_status(
     Classify the strength of problem evidence using semantic
     relationships between the post and the problem frame.
 
-    Task evidence establishes that the post concerns the relevant
-    activity or interaction.
-
-    Problem evidence provides additional support that the post
-    reflects the underlying need, difficulty, and/or desired outcome.
-
-    The two dimensions are intentionally not required to both exceed
-    a high threshold because short Reddit posts may express the
-    problem implicitly.
+    Thresholds are unchanged from before. What changed is that
+    TASK_WEIGHTS now includes action_alignment/target_alignment,
+    so the directional actor->action->target signal actually
+    participates in this decision instead of only affecting the
+    topical frame_score.
     """
 
-    activity = frame_scores.get(
-        "activity_alignment",
-        0.0,
+    task_evidence = _normalised_weighted_score(
+        frame_scores,
+        TASK_WEIGHTS,
     )
 
-    interaction = frame_scores.get(
-        "interaction_alignment",
-        0.0,
-    )
-
-    friction = frame_scores.get(
-        "friction_alignment",
-        0.0,
-    )
-
-    goal = frame_scores.get(
-        "goal_alignment",
-        0.0,
-    )
-
-    task_evidence = (
-        0.45 * activity
-        + 0.55 * interaction
-    )
-
-    problem_evidence = (
-        0.65 * friction
-        + 0.35 * goal
+    problem_evidence = _normalised_weighted_score(
+        frame_scores,
+        PROBLEM_WEIGHTS,
     )
 
     evidence_score = _problem_evidence_score(
         frame_scores
     )
 
-    # Strong task evidence + supporting problem evidence.
     if (
         task_evidence >= 0.50
         and problem_evidence >= 0.40
@@ -294,7 +362,6 @@ def _evidence_status(
     ):
         status = "problem_relevant"
 
-    # A post can still be useful when it strongly represents the problem but does not explicitly express every dimension.
     elif (
         task_evidence >= 0.58
         and problem_evidence >= 0.30
@@ -370,11 +437,6 @@ def _post_score(
         _evidence_status(frame_scores)
     )
 
-    # Problem relevance is the primary ranking signal.
-    #
-    # Evidence contributes independently so that two posts with
-    # similar topical similarity can still be separated based on
-    # how strongly they represent the actual problem.
     score = (
         POST_RELEVANCE_WEIGHT * frame_score
         + POST_EVIDENCE_WEIGHT * evidence_score
@@ -414,10 +476,80 @@ def _post_score(
     )
 
 
+def _aggregate_community(
+    qualifying_posts: list[tuple],
+    total_posts: int,
+) -> tuple[float, float, float]:
+    """
+    Return (evidence_mean, prevalence, avg_recency) for a set of
+    qualifying (score, post, signals) tuples.
+    """
+
+    qualifying_count = len(qualifying_posts)
+
+    evidence_mean = (
+        sum(item[0] for item in qualifying_posts)
+        / qualifying_count
+    )
+
+    prevalence = qualifying_count / max(1, total_posts)
+
+    avg_recency = (
+        sum(
+            item[2]["recency_score"]
+            for item in qualifying_posts
+        )
+        / qualifying_count
+    )
+
+    return evidence_mean, prevalence, avg_recency
+
+
+def _community_score(
+    qualifying_posts: list[tuple],
+    total_posts: int,
+) -> tuple[float, dict]:
+    qualifying_count = len(qualifying_posts)
+
+    evidence_mean, prevalence, avg_recency = _aggregate_community(
+        qualifying_posts,
+        total_posts,
+    )
+
+    support_factor = (
+        0.5
+        + 0.5 * min(1.0, qualifying_count / 2.0)
+    )
+
+    evidence_score = (
+        evidence_mean
+        * support_factor
+        * (0.5 + 0.5 * prevalence)
+    )
+
+    community_score = (
+        0.75 * evidence_score
+        + 0.20 * prevalence
+        + 0.05 * avg_recency
+    )
+
+    signals = {
+        "problem_relevant_posts": qualifying_count,
+        "evidence_mean": round(evidence_mean, 4),
+        "prevalence": round(prevalence, 4),
+        "avg_recency": round(avg_recency, 4),
+    }
+
+    return community_score, signals
+
+
 class CommunityRanker:
+
     def __init__(self, embeddings=None):
         """
-        If an embedding service is supplied, reuse it; else create one so the existing CommunityService
+        If an embedding service is supplied, reuse it.
+
+        Otherwise create one so the existing CommunityService
         constructor, which calls CommunityRanker(), remains
         compatible.
         """
@@ -435,32 +567,75 @@ class CommunityRanker:
         candidates: list[CommunityCandidate],
         limit: int = 5,
         context: str = "",
+        trace: dict | None = None,
     ) -> list[dict]:
         """
         Rank candidate communities using problem-relevant posts.
 
-        A community becomes recommendable only when at least one
-        retrieved post provides sufficient semantic evidence of
-        the represented problem.
+        Qualification is tiered:
+
+            "relevant"  -- has problem_relevant posts AND the
+                            aggregated community_score clears
+                            RELEVANT_COMMUNITY_SCORE_FLOOR. This is
+                            the bar that failed before: a single
+                            thin, borderline post used to be enough
+                            to earn "Relevant" regardless of how weak
+                            the aggregate evidence actually was.
+            "potential" -- fallback tier, used ONLY when nothing in
+                            this result set reaches "relevant".
+                            Pools problem_relevant + weak_or_ambiguous
+                            posts together, scored down so it can't
+                            be mistaken for -- or outrank -- a
+                            genuine "relevant" match.
+
+        This does not force a result count and does not lower any
+        post-level threshold. If nothing qualifies under either tier,
+        nothing is returned.
         """
 
         hypotheses = extract_problem_hypotheses(
             description
         )
 
+        if trace is not None:
+            trace.clear()
+            trace.update({
+                "hypothesis_count": len(hypotheses),
+                "config": {
+                    "min_post_score": MIN_POST_SCORE,
+                    "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
+                    "post_relevance_weight": POST_RELEVANCE_WEIGHT,
+                    "post_evidence_weight": POST_EVIDENCE_WEIGHT,
+                    "post_recency_weight": POST_RECENCY_WEIGHT,
+                    "frame_weights": FRAME_WEIGHTS,
+                    "task_weights": TASK_WEIGHTS,
+                    "problem_weights": PROBLEM_WEIGHTS,
+                    "relevant_community_score_floor": RELEVANT_COMMUNITY_SCORE_FLOOR,
+                    "potential_tier_penalty": POTENTIAL_TIER_PENALTY,
+                    "result_limit": limit,
+                },
+                "candidate_diagnostics": [],
+            })
+
         if not hypotheses:
+            if trace is not None:
+                trace.update({"selected_tier": None, "ranked_output": []})
             return []
 
-        results = []
+        per_candidate = []
 
         for candidate in candidates:
+
             scored_posts = []
+            post_diagnostics = []
 
             for post in candidate.posts:
+
                 best_score = 0.0
                 best_signals = None
 
                 for hypothesis in hypotheses:
+
                     score, signals = _post_score(
                         hypothesis,
                         post,
@@ -482,11 +657,25 @@ class CommunityRanker:
                             best_signals,
                         )
                     )
+                    post_diagnostics.append({
+                        "post_id": post.id,
+                        "score": round(best_score, 6),
+                        "signals": best_signals,
+                    })
 
             if not scored_posts:
+                if trace is not None:
+                    trace["candidate_diagnostics"].append({
+                        "subreddit": candidate.subreddit,
+                        "input_post_count": len(candidate.posts),
+                        "scored_post_count": 0,
+                        "posts": [],
+                    })
                 continue
 
-            qualifying_posts = [
+            total_posts = len(scored_posts)
+
+            strong_posts = [
                 item
                 for item in scored_posts
                 if (
@@ -496,18 +685,22 @@ class CommunityRanker:
                 )
             ]
 
-            total_posts = len(
-                scored_posts
-            )
+            weak_posts = [
+                item
+                for item in scored_posts
+                if (
+                    item[0] >= MIN_POST_SCORE
+                    and item[2]["evidence_status"]
+                    == "weak_or_ambiguous"
+                )
+            ]
 
-            qualifying_count = len(
-                qualifying_posts
-            )
-            # Diagnostic 
+            # Diagnostic output (unchanged from before).
             print(
                 f"\n[r/{candidate.subreddit}] "
                 f"total={total_posts}, "
-                f"qualifying={qualifying_count}"
+                f"strong={len(strong_posts)}, "
+                f"weak={len(weak_posts)}"
             )
 
             for score, post, signals in scored_posts:
@@ -516,128 +709,150 @@ class CommunityRanker:
                     f"{signals['evidence_status']} | "
                     f"{post.title}"
                 )
-            # No actual problem evidence means the community should not be recommended.
-            if qualifying_count == 0:
+
+            per_candidate.append(
+                {
+                    "subreddit": candidate.subreddit,
+                    "total_posts": total_posts,
+                    "strong_posts": strong_posts,
+                    "weak_posts": weak_posts,
+                }
+            )
+
+            if trace is not None:
+                trace["candidate_diagnostics"].append({
+                    "subreddit": candidate.subreddit,
+                    "input_post_count": len(candidate.posts),
+                    "scored_post_count": total_posts,
+                    "strong_post_count": len(strong_posts),
+                    "weak_or_ambiguous_post_count": len(weak_posts),
+                    "posts": post_diagnostics,
+                })
+
+        # ---------------------------------------------------------
+        # Pass 1: relevant tier, with the community-score floor.
+        # ---------------------------------------------------------
+
+        relevant_results = []
+
+        for entry in per_candidate:
+            if not entry["strong_posts"]:
                 continue
 
-            qualifying_posts.sort(
+            entry["strong_posts"].sort(
                 key=lambda item: item[0],
                 reverse=True,
             )
 
-            evidence_mean = (
-                sum(
-                    item[0]
-                    for item in qualifying_posts
-                )
-                / qualifying_count
+            community_score, signals = _community_score(
+                entry["strong_posts"],
+                entry["total_posts"],
             )
 
-            prevalence = (
-                qualifying_count
-                / max(
-                    1,
-                    total_posts,
-                )
-            )
-
-            avg_recency = (
-                sum(
-                    item[2]["recency_score"]
-                    for item in qualifying_posts
-                )
-                / qualifying_count
-            )
-
-            # Communities supported by multiple problem-relevant
-            # posts receive more confidence than communities with
-            # only 1 accidental match.
-            support_factor = (
-                0.5
-                + 0.5
-                * min(
-                    1.0,
-                    qualifying_count / 2.0,
-                )
-            )
-
-            evidence_score = (
-                evidence_mean
-                * support_factor
-                * (
-                    0.5
-                    + 0.5 * prevalence
-                )
-            )
-
-            community_score = (
-                0.75 * evidence_score
-                + 0.20 * prevalence
-                + 0.05 * avg_recency
-            )
+            if community_score < RELEVANT_COMMUNITY_SCORE_FLOOR:
+                # Technically has a problem_relevant post, but the
+                # aggregate is too thin to trust. Falls through to
+                # the potential-tier pass instead.
+                continue
 
             top_posts = []
-
-            for (
-                score,
-                post,
-                signals,
-            ) in qualifying_posts[:3]:
-
-                post.evidence_status = (
-                    signals["evidence_status"]
-                )
-
+            for score, post, post_signals in entry["strong_posts"][:3]:
+                post.evidence_status = post_signals["evidence_status"]
                 top_posts.append(post)
 
-            results.append(
+            relevant_results.append(
                 {
-                    "subreddit": candidate.subreddit,
-                    "score": round(
-                        community_score,
-                        4,
-                    ),
+                    "subreddit": entry["subreddit"],
+                    "score": round(community_score, 4),
+                    "status": "relevant",
                     "top_posts": top_posts,
-                    "signals": {
-                        "total_posts": total_posts,
-                        "problem_relevant_posts": (
-                            qualifying_count
-                        ),
-                        "evidence_mean": round(
-                            evidence_mean,
-                            4,
-                        ),
-                        "prevalence": round(
-                            prevalence,
-                            4,
-                        ),
-                        "avg_recency": round(
-                            avg_recency,
-                            4,
-                        ),
-                        "post_signals": [
-                            {
-                                "post_id": post.id,
-                                "score": round(
-                                    score,
-                                    4,
-                                ),
-                                **signals,
-                            }
-                            for (
-                                score,
-                                post,
-                                signals,
-                            )
-                            in scored_posts
-                        ],
-                    },
+                    "signals": signals,
                 }
             )
 
-        results.sort(
+        if relevant_results:
+            relevant_results.sort(
+                key=lambda result: result["score"],
+                reverse=True,
+            )
+            ranked_output = relevant_results[:limit]
+            if trace is not None:
+                trace.update({
+                    "selected_tier": "relevant",
+                    "ranked_output": [
+                        {
+                            "rank": index,
+                            "subreddit": item["subreddit"],
+                            "score": item["score"],
+                            "status": item["status"],
+                            "signals": item["signals"],
+                            "top_post_ids": [post.id for post in item["top_posts"]],
+                        }
+                        for index, item in enumerate(ranked_output, start=1)
+                    ],
+                })
+            return ranked_output
+
+        # ---------------------------------------------------------
+        # Pass 2: nothing reached "relevant". Fall back to
+        # "potential" using strong + weak evidence pooled together,
+        # rather than returning zero communities.
+        # ---------------------------------------------------------
+
+        potential_results = []
+
+        for entry in per_candidate:
+            pooled = entry["strong_posts"] + entry["weak_posts"]
+
+            if not pooled:
+                continue
+
+            pooled.sort(
+                key=lambda item: item[0],
+                reverse=True,
+            )
+
+            community_score, signals = _community_score(
+                pooled,
+                entry["total_posts"],
+            )
+
+            community_score *= POTENTIAL_TIER_PENALTY
+
+            top_posts = []
+            for score, post, post_signals in pooled[:3]:
+                post.evidence_status = post_signals["evidence_status"]
+                top_posts.append(post)
+
+            potential_results.append(
+                {
+                    "subreddit": entry["subreddit"],
+                    "score": round(community_score, 4),
+                    "status": "potential",
+                    "top_posts": top_posts,
+                    "signals": signals,
+                }
+            )
+
+        potential_results.sort(
             key=lambda result: result["score"],
             reverse=True,
         )
 
-        return results[:limit]
+        ranked_output = potential_results[:limit]
+        if trace is not None:
+            trace.update({
+                "selected_tier": "potential" if ranked_output else None,
+                "ranked_output": [
+                    {
+                        "rank": index,
+                        "subreddit": item["subreddit"],
+                        "score": item["score"],
+                        "status": item["status"],
+                        "signals": item["signals"],
+                        "top_post_ids": [post.id for post in item["top_posts"]],
+                    }
+                    for index, item in enumerate(ranked_output, start=1)
+                ],
+            })
+        return ranked_output

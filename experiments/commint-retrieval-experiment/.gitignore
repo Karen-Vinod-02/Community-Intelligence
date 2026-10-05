@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+.env
+
+data/raw/
+data/normalized/
+data/pools/
+
+results/
+
+.DS_Store

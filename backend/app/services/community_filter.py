@@ -6,7 +6,7 @@ class CommunityFilter:
     Reranks candidate communities using semantic evidence from
     their retrieved posts.
 
-    Domain-agnostic. 
+    Domain-agnostic.
     """
 
     def __init__(self, embeddings):
@@ -110,10 +110,12 @@ class CommunityFilter:
 
         frame_weights = {
             "actor": 0.10,
-            "activity": 0.20,
-            "interaction": 0.25,
-            "friction": 0.30,
-            "goal": 0.15,
+            "action": 0.20,
+            "target": 0.20,
+            "activity": 0.15,
+            "interaction": 0.15,
+            "friction": 0.10,
+            "goal": 0.10,
         }
 
         post_scores = []
@@ -128,8 +130,18 @@ class CommunityFilter:
 
             for hypothesis in hypotheses:
                 frames = {
-                    "actor": hypothesis.actor or "",
-                    "activity": hypothesis.activity or "",
+                    "actor": (
+                        hypothesis.actor or ""
+                    ),
+                    "action": (
+                        hypothesis.action or ""
+                    ),
+                    "target": (
+                        hypothesis.target or ""
+                    ),
+                    "activity": (
+                        hypothesis.activity or ""
+                    ),
                     "interaction": (
                         hypothesis.interaction or ""
                     ),
@@ -239,6 +251,7 @@ class CommunityFilter:
         description: str,
         candidates: list[CommunityCandidate],
         queries=None,
+        trace: dict | None = None,
     ) -> list[CommunityCandidate]:
         """
         Rerank candidate communities using semantic problem
@@ -268,6 +281,27 @@ class CommunityFilter:
             key=lambda item: item[0],
             reverse=True,
         )
+
+        if trace is not None:
+            trace["config"] = {
+                "semantic_relevance_weight": 0.35,
+                "problem_frame_relevance_weight": 0.55,
+                "evidence_density_weight": 0.10,
+                "evidence_density_posts_saturation": 5,
+            }
+            trace["input_order"] = [candidate.subreddit for candidate in candidates]
+            trace["scores"] = [
+                {
+                    "subreddit": candidate.subreddit,
+                    "score": score,
+                    "post_ids": [
+                        getattr(post, "id", None)
+                        for post in candidate.posts
+                    ],
+                }
+                for score, candidate in scored
+            ]
+            trace["output_order"] = [candidate.subreddit for _, candidate in scored]
 
         return [
             candidate
