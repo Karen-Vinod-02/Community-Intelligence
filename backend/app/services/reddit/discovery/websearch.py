@@ -1,13 +1,14 @@
 import logging
-import os
 import re
-import time
-from functools import lru_cache
 
-from ddgs import DDGS
+import requests
 
-from app.services.embeddings import EmbeddingService
-from app.services.reddit.discovery.base import DiscoverySource
+from app.services.embeddings import get_embedding_service
+from app.services.reddit.discovery.base import (
+    CommunityDiscoveryResults,
+    DiscoverySource,
+)
+from app.services.web_search import search_text
 
 
 SUBREDDIT_URL_RE = re.compile(
@@ -29,67 +30,85 @@ EXCLUDED = {
     "wiki",
 }
 
-MAX_RETRIES = 2
-RETRY_BACKOFF_SECONDS = 2
-DISCOVERY_RELEVANCE_THRESHOLD = float(
-    os.getenv(
-        "REDDIT_DISCOVERY_RELEVANCE_THRESHOLD",
-        "0.18",
-    )
-)
-
 # Retrieve a larger candidate pool from web search so that useful communities are not lost before the downstream Reddit ranking stage.
 DISCOVERY_RESULT_MULTIPLIER = 6
 
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=1)
-def _embedding_service() -> EmbeddingService:
-    return EmbeddingService()
-
-
 class WebSearchDiscoverySource(DiscoverySource):
 
     def __init__(
         self,
-        backend: str = "auto",
-        max_retries: int = MAX_RETRIES,
+        backend: str = "duckduckgo",
     ):
         self.backend = backend
-        self.max_retries = max_retries
-        self.discovery_evidence: dict[str, list[dict]] = {}
 
     def _search(
         self,
         query: str,
         max_results: int,
     ) -> list:
-        last_exception = None
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                with DDGS() as ddgs:
-                    return list(
-                        ddgs.text(
-                            query,
-                            max_results=max_results,
-                            backend=self.backend,
-                        )
-                    )
-            except Exception as exc:
-                last_exception = exc
-                if attempt < self.max_retries:
-                    time.sleep(
-                        RETRY_BACKOFF_SECONDS * (attempt + 1)
-                    )
-
-        logger.warning(
-            "Web search failed after retries: %s",
-            last_exception,
+        results, _, error = search_text(
+            query,
+            max_results=max_results,
+            preferred_backend=self.backend,
         )
+        if error is not None:
+            logger.warning(
+                "Reddit community indexed search failed; trying Reddit search API: %s",
+                error,
+            )
+            results = self._search_reddit_api(query, max_results)
+            if not results:
+                raise RuntimeError(
+                    "Reddit community search failed on indexed search and Reddit API."
+                ) from error
+        return results
 
-        return []
+    @staticmethod
+    def _search_reddit_api(query: str, max_results: int) -> list[dict]:
+        """Use Reddit's public post search when web indexes are unavailable."""
+        try:
+            response = requests.get(
+                "https://www.reddit.com/search.json",
+                params={
+                    "q": re.sub(
+                        r"^site:reddit\.com/r/\s*",
+                        "",
+                        query,
+                        flags=re.IGNORECASE,
+                    ),
+                    "sort": "relevance",
+                    "t": "month",
+                    "type": "link",
+                    "limit": max_results,
+                    "raw_json": 1,
+                },
+                headers={
+                    "User-Agent": "CommInt/0.1 (community research prototype)"
+                },
+                timeout=(2, 6),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            results = []
+            for child in payload.get("data", {}).get("children", []):
+                post = child.get("data", {})
+                subreddit = str(post.get("subreddit") or "").strip()
+                permalink = str(post.get("permalink") or "").strip()
+                if not subreddit or not permalink:
+                    continue
+                results.append({
+                    "href": f"https://www.reddit.com{permalink}",
+                    "title": str(post.get("title") or ""),
+                    "body": str(post.get("selftext") or ""),
+                    "verified_source": "reddit_json",
+                })
+            return results
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            logger.info("Reddit community API fallback failed: %s", exc)
+            return []
 
     @staticmethod
     def _result_text(result: dict) -> str:
@@ -113,7 +132,7 @@ class WebSearchDiscoverySource(DiscoverySource):
         if not result_text:
             return 0.0
 
-        embeddings = _embedding_service().encode(
+        embeddings = get_embedding_service().encode(
             [
                 query,
                 result_text,
@@ -138,6 +157,7 @@ class WebSearchDiscoverySource(DiscoverySource):
 
         communities = []
         seen = set()
+        relevance_by_community = {}
         evidence = []
 
         for result in results:
@@ -158,18 +178,11 @@ class WebSearchDiscoverySource(DiscoverySource):
                 result,
             )
 
-            if score < DISCOVERY_RELEVANCE_THRESHOLD:
-                logger.debug(
-                    "Rejected r/%s for discovery query '%s' "
-                    "(score %.3f): %s",
-                    subreddit,
-                    query,
-                    score,
-                    self._result_text(result)[:160],
-                )
-                continue
-
             key = subreddit.casefold()
+            relevance_by_community[key] = max(
+                score,
+                relevance_by_community.get(key, 0.0),
+            )
 
             evidence.append(
                 {
@@ -191,11 +204,10 @@ class WebSearchDiscoverySource(DiscoverySource):
                 seen.add(key)
                 communities.append(subreddit)
 
-        for item in evidence:
-            self.discovery_evidence.setdefault(
-                item["subreddit"],
-                [],
-            ).append(item)
+        communities.sort(
+            key=lambda name: relevance_by_community[name.casefold()],
+            reverse=True,
+        )
 
         logger.debug(
             "Discovery query '%s' produced %d candidate communities",
@@ -203,4 +215,14 @@ class WebSearchDiscoverySource(DiscoverySource):
             len(communities),
         )
 
-        return communities
+        selected = communities[:limit]
+        selected_keys = {name.casefold() for name in selected}
+        evidence_by_community = {}
+        for item in evidence:
+            if item["subreddit"].casefold() in selected_keys:
+                evidence_by_community.setdefault(
+                    item["subreddit"],
+                    [],
+                ).append(item)
+
+        return CommunityDiscoveryResults(selected, evidence_by_community)

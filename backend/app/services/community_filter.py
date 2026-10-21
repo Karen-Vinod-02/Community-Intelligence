@@ -246,6 +246,13 @@ class CommunityFilter:
             min(1.0, score),
         )
 
+    def score_candidate(
+        self,
+        description: str,
+        candidate: CommunityCandidate,
+    ) -> float:
+        return self._community_intent_score(description, candidate)
+
     def rerank(
         self,
         description: str,
@@ -265,7 +272,7 @@ class CommunityFilter:
         scored = []
 
         for candidate in candidates:
-            score = self._community_intent_score(
+            score = self.score_candidate(
                 description,
                 candidate,
             )

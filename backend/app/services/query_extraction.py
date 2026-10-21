@@ -63,6 +63,68 @@ _MEANINGFUL_STOP_WORDS = ENGLISH_STOP_WORDS - {
     "helping",
 }
 
+_PROBLEM_ACTIONS = (
+    "find",
+    "discover",
+    "connect",
+    "understand",
+    "manage",
+    "track",
+    "compare",
+    "organize",
+    "organise",
+    "learn",
+    "build",
+    "create",
+    "hire",
+    "sell",
+    "buy",
+    "share",
+    "coordinate",
+    "schedule",
+    "plan",
+    "analyze",
+    "analyse",
+    "monitor",
+    "review",
+    "match",
+    "book",
+    "raise",
+    "save",
+    "budget",
+    "budgets",
+    "stay",
+    "maintain",
+    "remain",
+    "keep",
+    "reduce",
+    "improve",
+    "automate",
+    "validate",
+    "grow",
+    "launch",
+    "write",
+    "prepare",
+    "access",
+    "reach",
+    "meet",
+    "mentor",
+    "discuss",
+    "solve",
+    "develop",
+    "finds",
+    "tracks",
+    "builds",
+    "creates",
+    "manages",
+    "organizes",
+    "organises",
+    "connects",
+    "understands",
+    "compares",
+    "saves",
+)
+
 
 @dataclass(frozen=True)
 class ProblemHypothesis:
@@ -235,6 +297,38 @@ def _build_hypothesis(
     )
 
 
+def _build_hypotheses_from_target(
+    actor: str,
+    action: str,
+    target: str,
+    confidence: float,
+) -> tuple[ProblemHypothesis, ...]:
+    action_pattern = "|".join(
+        sorted(_PROBLEM_ACTIONS, key=len, reverse=True)
+    )
+    compound_match = re.search(
+        rf"\s+(?:and|or)\s+({action_pattern})\s+(.+)$",
+        target,
+    )
+    if compound_match is None:
+        return (_build_hypothesis(actor, action, target, confidence),)
+
+    primary_target = target[:compound_match.start()].strip()
+    secondary_target = compound_match.group(2).strip()
+    if not primary_target or not secondary_target:
+        return (_build_hypothesis(actor, action, target, confidence),)
+
+    return (
+        _build_hypothesis(actor, action, primary_target, confidence),
+        _build_hypothesis(
+            actor,
+            compound_match.group(1),
+            secondary_target,
+            confidence * 0.85,
+        ),
+    )
+
+
 def _problem_hypotheses(
     description: str,
 ) -> tuple[ProblemHypothesis, ...]:
@@ -248,14 +342,20 @@ def _problem_hypotheses(
     """
 
     normalised = _normalise(description)
-
-    # ------------------------------------------------------------
-    # Pattern 1:
-    #
-    # "connecting local farmers directly with customers"
-    #
-    # Actor and target are explicitly present around the relationship.
-    # ------------------------------------------------------------
+    budgeting_match = re.search(
+        r"\bhelp(?:s|ing)?\s+(.+?)\s+(?:to\s+)?budget(?:ing)?"
+        r"(?:\s+(?:their|personal|monthly)?\s*(?:money|finances?|expenses?))?"
+        r"(?:[.!?]|$)",
+        normalised,
+    )
+    if budgeting_match:
+        actor = budgeting_match.group(1)
+        return (_build_hypothesis(
+            actor=actor,
+            action="budget",
+            target="money and expenses",
+            confidence=0.95,
+        ),)
 
     connection_match = re.search(
         r"\bconnecting\s+(.+?)\s+"
@@ -304,126 +404,70 @@ def _problem_hypotheses(
 
         return (hypothesis,)
 
-    # ------------------------------------------------------------
-    # Pattern 2:
-    #
-    # "helping students find reliable study partners"
-    #
-    # Crucially, the token immediately following "helping <actor>"
-    # is treated as the action. No action vocabulary is required.
-    # ------------------------------------------------------------
-
+    action_pattern = "|".join(
+        sorted(_PROBLEM_ACTIONS, key=len, reverse=True)
+    )
     helping_match = re.search(
-        r"\bhelping\s+(.+?)\s+"
-        r"([a-zA-Z][a-zA-Z'-]*)\s+"
-        r"(.+?)(?:[.!?]|$)",
+        rf"\bhelping\s+(.+?)\s+"
+        rf"({action_pattern})\s+"
+        rf"(.+?)(?:[.!?]|$)",
         normalised,
     )
 
     if helping_match:
-        actor = helping_match.group(1)
-        action = helping_match.group(2)
-        target = helping_match.group(3)
-
-        return (
-            _build_hypothesis(
-                actor=actor,
-                action=action,
-                target=target,
-                confidence=1.0,
-            ),
+        return _build_hypotheses_from_target(
+            actor=helping_match.group(1),
+            action=helping_match.group(2),
+            target=helping_match.group(3),
+            confidence=1.0,
         )
 
-    # ------------------------------------------------------------
-    # Pattern 3:
-    #
-    # "helps students find reliable study partners"
-    # "help students find reliable study partners"
-    # ------------------------------------------------------------
-
     helps_match = re.search(
-        r"\bhelp(?:s)?\s+(.+?)\s+"
-        r"([a-zA-Z][a-zA-Z'-]*)\s+"
-        r"(.+?)(?:[.!?]|$)",
+        rf"\bhelp(?:s)?\s+(.+?)\s+"
+        rf"({action_pattern})\s+"
+        rf"(.+?)(?:[.!?]|$)",
         normalised,
     )
 
     if helps_match:
-        actor = helps_match.group(1)
-        action = helps_match.group(2)
-        target = helps_match.group(3)
-
-        return (
-            _build_hypothesis(
-                actor=actor,
-                action=action,
-                target=target,
-                confidence=1.0,
-            ),
+        return _build_hypotheses_from_target(
+            actor=helps_match.group(1),
+            action=helps_match.group(2),
+            target=helps_match.group(3),
+            confidence=1.0,
         )
 
-    # ------------------------------------------------------------
-    # Pattern 4:
-    #
-    # "enabling developers to understand large codebases"
-    # "allows developers to understand large codebases"
-    # "lets developers understand large codebases"
-    #
-    # The action is again obtained from its grammatical position.
-    # ------------------------------------------------------------
-
     enabling_match = re.search(
-        r"\b(?:enabling|enables|allowing|allows|letting|lets)\s+"
-        r"(.+?)\s+"
-        r"(?:to\s+)?"
-        r"([a-zA-Z][a-zA-Z'-]*)\s+"
-        r"(.+?)(?:[.!?]|$)",
+        rf"\b(?:enabling|enables|allowing|allows|letting|lets)\s+"
+        rf"(.+?)\s+"
+        rf"(?:to\s+)?"
+        rf"({action_pattern})\s+"
+        rf"(.+?)(?:[.!?]|$)",
         normalised,
     )
 
     if enabling_match:
-        actor = enabling_match.group(1)
-        action = enabling_match.group(2)
-        target = enabling_match.group(3)
-
-        return (
-            _build_hypothesis(
-                actor=actor,
-                action=action,
-                target=target,
-                confidence=0.95,
-            ),
+        return _build_hypotheses_from_target(
+            actor=enabling_match.group(1),
+            action=enabling_match.group(2),
+            target=enabling_match.group(3),
+            confidence=0.95,
         )
 
-    # ------------------------------------------------------------
-    # Pattern 5:
-    #
-    # "for developers to understand large codebases"
-    #
-    # This is a weaker fallback because the actor/action relationship
-    # is less explicitly tied to a product construction pattern.
-    # ------------------------------------------------------------
-
     for_match = re.search(
-        r"\bfor\s+(.+?)\s+"
-        r"(?:to\s+)?"
-        r"([a-zA-Z][a-zA-Z'-]*)\s+"
-        r"(.+?)(?:[.!?]|$)",
+        rf"\bfor\s+(.+?)\s+"
+        rf"(?:to\s+)?"
+        rf"({action_pattern})\s+"
+        rf"(.+?)(?:[.!?]|$)",
         normalised,
     )
 
     if for_match:
-        actor = for_match.group(1)
-        action = for_match.group(2)
-        target = for_match.group(3)
-
-        return (
-            _build_hypothesis(
-                actor=actor,
-                action=action,
-                target=target,
-                confidence=0.70,
-            ),
+        return _build_hypotheses_from_target(
+            actor=for_match.group(1),
+            action=for_match.group(2),
+            target=for_match.group(3),
+            confidence=0.70,
         )
 
     return ()
@@ -468,6 +512,34 @@ def _relationship_phrases(
     )
 
 
+def _discovery_phrases(
+    hypothesis: ProblemHypothesis,
+) -> tuple[str, ...]:
+    """
+    Short, natural phrases people actually write in forum titles.
+    Ordered by expected search usefulness.
+    """
+
+    actor = hypothesis.actor
+    action = hypothesis.action
+    target = hypothesis.target
+
+    if not action or not target:
+        return ()
+
+    phrases = [
+        f"looking for {target}",
+        f"{target} recommendations",
+        f"how to {action} {target}",
+        f"need help to {action} {target}",
+        f"where to {action} {target}",
+    ]
+    if actor:
+        phrases.append(f"{actor} {target}")
+        phrases.append(f"{actor} struggling to {action} {target}")
+    return tuple(phrases)
+
+
 def extract_search_queries(
     description: str,
     max_queries: int = 8,
@@ -476,7 +548,8 @@ def extract_search_queries(
     Produce discovery queries from the extracted problem structure.
 
     Queries prioritize the explicit actor/action/target relationship,
-    then fall back to broader concept-level formulations.
+    then natural forum-style phrasings, then broader concept-level
+    formulations.
     """
 
     if (
@@ -495,26 +568,28 @@ def extract_search_queries(
         description
     )
 
-    hypothesis = (
-        hypotheses[0]
-        if hypotheses
-        else None
-    )
-
     queries = []
     seen = set()
 
-    if hypothesis:
-        for query in _relationship_phrases(
-            hypothesis
-        ):
+    if hypotheses:
+        for item in hypotheses:
             if _add_query(
                 queries,
                 seen,
-                query,
+                f"{item.actor or ''} {item.action or ''} {item.target or ''}",
                 max_queries,
             ):
                 return queries
+
+        for item in hypotheses:
+            for query in _discovery_phrases(item):
+                if _add_query(queries, seen, query, max_queries):
+                    return queries
+
+        for item in hypotheses:
+            for query in _relationship_phrases(item)[1:]:
+                if _add_query(queries, seen, query, max_queries):
+                    return queries
 
     concept = _core(words)
 

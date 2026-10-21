@@ -12,6 +12,9 @@ class RedditPost(BaseModel):
     created_utc: float | None = None
     url: str | None = None
     evidence_status: str | None = None
+    evidence_source: str | None = None
+    problem_match: dict[str, float] | None = None
+    recency_verified: bool = False
 
 
 class RedditComment(BaseModel):

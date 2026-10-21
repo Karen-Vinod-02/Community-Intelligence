@@ -1,5 +1,8 @@
 import time
 import os
+import threading
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -16,9 +19,16 @@ HEADERS = {
     "User-Agent": "community-intelligence/0.1"
 }
 
-REQUEST_TIMEOUT_SECONDS = 30
-MAX_RETRIES = 2
-RETRY_BACKOFF_SECONDS = 1
+REQUEST_TIMEOUT_SECONDS = 10
+MAX_RETRIES = 0
+RETRY_BACKOFF_SECONDS = 0.5
+MAX_RETRY_AFTER_SECONDS = 10
+RATE_LIMIT_COOLDOWN_SECONDS = 30
+INVALID_REQUEST_COOLDOWN_SECONDS = 120
+
+
+class ArcticShiftUnavailable(RuntimeError):
+    pass
 
 
 class ArcticShiftSource(RedditSource):
@@ -32,13 +42,36 @@ class ArcticShiftSource(RedditSource):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self._state_lock = threading.Lock()
+        self._blocked_until = 0.0
+        self._blocked_reason: str | None = None
+
+    def _check_available(self) -> None:
+        with self._state_lock:
+            remaining = self._blocked_until - time.monotonic()
+            reason = self._blocked_reason
+        if remaining > 0:
+            raise ArcticShiftUnavailable(
+                f"Arctic Shift temporarily unavailable ({reason}); "
+                f"retry in about {int(remaining) + 1}s."
+            )
+
+    def _block(self, seconds: float, reason: str) -> None:
+        with self._state_lock:
+            self._blocked_until = max(
+                self._blocked_until,
+                time.monotonic() + seconds,
+            )
+            self._blocked_reason = reason
 
     def _request(self, endpoint: str, params: dict):
+        self._check_available()
         url = f"{self.base_url}/{endpoint}"
 
         last_exception = None
 
         for attempt in range(self.max_retries + 1):
+            retry_after = None
             try:
                 response = requests.get(
                     url,
@@ -48,7 +81,6 @@ class ArcticShiftSource(RedditSource):
                 )
 
                 response.raise_for_status()
-
                 return response
 
             except requests.HTTPError as exc:
@@ -59,7 +91,16 @@ class ArcticShiftSource(RedditSource):
                 )
 
                 if status is not None and 400 <= status < 500:
-                    raise
+                    if status not in (408, 429):
+                        raise
+
+                if status == 429 and exc.response is not None:
+                    retry_after = exc.response.headers.get("Retry-After")
+                    delay = self._retry_delay(retry_after, attempt)
+                    self._block(
+                        self._rate_limit_cooldown(retry_after),
+                        "rate limited (HTTP 429)",
+                    )
 
                 last_exception = exc
 
@@ -67,11 +108,54 @@ class ArcticShiftSource(RedditSource):
                 last_exception = exc
 
             if attempt < self.max_retries:
-                time.sleep(
-                    RETRY_BACKOFF_SECONDS * (attempt + 1)
-                )
+                delay = self._retry_delay(retry_after, attempt)
+                if delay is None:
+                    raise last_exception
+                time.sleep(delay)
 
         raise last_exception
+
+    @staticmethod
+    def _retry_delay(retry_after: str | None, attempt: int) -> float | None:
+        if retry_after:
+            delay = ArcticShiftSource._parse_retry_after(retry_after)
+            if delay is None:
+                delay = RETRY_BACKOFF_SECONDS * (attempt + 1)
+
+            if delay > MAX_RETRY_AFTER_SECONDS:
+                return None
+            return max(0.0, delay)
+
+        return RETRY_BACKOFF_SECONDS * (attempt + 1)
+
+    @staticmethod
+    def _parse_retry_after(retry_after: str) -> float | None:
+        try:
+            return float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return (
+                    retry_at - datetime.now(timezone.utc)
+                ).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    @staticmethod
+    def _rate_limit_cooldown(retry_after: str | None) -> float:
+        delay = (
+            ArcticShiftSource._parse_retry_after(retry_after)
+            if retry_after
+            else None
+        )
+        if delay is None:
+            return RATE_LIMIT_COOLDOWN_SECONDS
+        return min(
+            max(delay, RATE_LIMIT_COOLDOWN_SECONDS),
+            300.0,
+        )
 
     def search_posts(
         self,
@@ -108,11 +192,29 @@ class ArcticShiftSource(RedditSource):
             if status == 422 and query:
                 params.pop("query", None)
 
-                response = self._request(
-                    "posts/search",
-                    params,
-                )
+                try:
+                    response = self._request(
+                        "posts/search",
+                        params,
+                    )
+                except requests.HTTPError as fallback_exc:
+                    fallback_status = (
+                        fallback_exc.response.status_code
+                        if fallback_exc.response is not None
+                        else None
+                    )
+                    if fallback_status == 422:
+                        self._block(
+                            INVALID_REQUEST_COOLDOWN_SECONDS,
+                            "recent-post fallback rejected (HTTP 422)",
+                        )
+                    raise
             else:
+                if status == 422:
+                    self._block(
+                        INVALID_REQUEST_COOLDOWN_SECONDS,
+                        "recent-post search rejected (HTTP 422)",
+                    )
                 raise
 
         payload = response.json()
